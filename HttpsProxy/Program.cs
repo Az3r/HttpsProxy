@@ -82,8 +82,49 @@ namespace HttpsProxy
     {
         private TcpClient m_tcpSocket = null;
         private byte[] m_buffer = null;
-
         ManualResetEvent eventFinishReading = null;
+
+        private class RequestHeader
+        {
+           public string Method { get; set; } = null;
+           public string Domain { get; set; } = null;
+           public string Port { get; set; } = null;
+        }
+
+        static private RequestHeader ParseRequest(string raw_request)
+        {
+            try
+            {
+                if (string.IsNullOrEmpty(raw_request)) return null;
+                if (string.IsNullOrWhiteSpace(raw_request)) return null;
+
+                RequestHeader header = new RequestHeader();
+                header.Method = raw_request.Substring(0, raw_request.IndexOf(' '));
+
+                int HostStart = raw_request.IndexOf("Host: ");
+                int HostEnd = raw_request.IndexOfAny(new char[] {'\r', '\n' }, HostStart);
+
+                string Host = raw_request.Substring(HostStart + 6, HostEnd - HostStart);
+                try
+                {
+                    int i = Host.IndexOf(':');
+                    header.Domain = Host.Substring(0, i);
+                    header.Port = Host.Substring(i + 1, Host.IndexOfAny(new char[] { '\r', '\n' }) - i - 1);
+                }
+                catch (ArgumentOutOfRangeException)
+                {
+                    header.Domain = Host;
+                    header.Port = "80";
+                }
+                return header;
+
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                return null;
+            }
+        }
+
         public ProtocolDistributor(TcpClient tcp)
         {
             m_tcpSocket = tcp;
@@ -109,15 +150,16 @@ namespace HttpsProxy
         {
             if (m_tcpSocket == null) return;
 
-            // Create a thread to translate incoming bytes into request string
-
+            // Read bytes and traslate client's request into string
             object[] ObjectState = new object[2] { m_tcpSocket.GetStream(), new StringBuilder() };
 
             IAsyncResult Result = m_tcpSocket.GetStream().BeginRead(m_buffer, 0, m_buffer.Length, new AsyncCallback(ReadCallBack), ObjectState);
 
             // Wait until finishing reading client's request
             eventFinishReading.WaitOne();
-            Console.WriteLine(ObjectState[1].ToString());
+            RequestHeader header = ParseRequest(ObjectState[1].ToString());
+            if (header != null)
+                Console.WriteLine("Method: {0}\nHost: {1}:{2}\n", header.Method, header.Domain, header.Port);
         }
 
         private void ReadCallBack(IAsyncResult ar)
@@ -141,11 +183,11 @@ namespace HttpsProxy
             {
                 // Read until there is no more data to be transferred
                 stream.BeginRead(m_buffer, 0, m_buffer.Length, new AsyncCallback(ReadCallBack), ObjectState);
-                eventFinishReading.WaitOne();
             }
             else eventFinishReading.Set();
 
             //Console.WriteLine("Thead ID {0} exits", Thread.CurrentThread.ManagedThreadId);
         }
     }
+
 }
