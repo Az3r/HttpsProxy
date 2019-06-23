@@ -1,15 +1,23 @@
 ﻿using System;
 using System.Net;
 using System.Net.Sockets;
+using System.Net.Security;
 using System.Threading;
+using System.Threading.Tasks;
 using System.Text;
 using System.Collections.Generic;
+using System.IO;
 namespace HttpsProxy
 {
     static public class AppSignal
     {
         static public bool Exit { get; set; } = false;
         static public ManualResetEvent EventExitProgram { get; set; } = new ManualResetEvent(false);
+    }
+    static public class Default
+    {
+        static public readonly int ReceivedBufferSize = 5000;
+        static public readonly int SendBufferSize = 65000;
     }
     class Program
     {
@@ -91,7 +99,7 @@ namespace HttpsProxy
 
                 // Make this thread background so connection with client will be closed automatically when the thread is destroyed
                 if (distributor.Start("ProtocolDistributor", true) == false)
-                    Logging.Log("Null Instance of TcpClient detected in ProxyListener.Run()", LoggingLevel.Warning);
+                    Logging.Log("Null Instance of TcpClient detected in ProxyListener.Run()", LoggingLevel.Error);
             }
             ExitInstance();
         }
@@ -99,20 +107,78 @@ namespace HttpsProxy
 
     public class StreamState
     {
-        public NetworkStream ReadStream { get; set; } = null;
-        public NetworkStream WriteStream { get; set; } = null;
+        public Stream ClientStream { get; set; } = null;
+        public Stream ServerStream { get; set; } = null;
         public byte[] Buffer { get; set; } = null;
-        public StringBuilder StrBuilder { get; set; } = null;
     }
+    public static class ProxyOperation
+    {
+        public static List<byte> ReadRequest(NetworkStream source)
+        {
+            try
+            {
+                List<byte> result = new List<byte>();
+                byte[] buffer = new byte[Default.ReceivedBufferSize];
+
+                do
+                {
+                    int bytesRead = source.Read(buffer, 0, buffer.Length);
+
+                    // Expand array as much as bytes read
+                    for (int i = 0; i < bytesRead; ++i)
+                        result.Add(buffer[i]);
+
+                } while (source.DataAvailable);
+
+                return result;
+            }
+            catch (System.IO.IOException e)
+            {
+                if(e.InnerException is SocketException sErr)
+                {
+                    if (sErr.ErrorCode == 10053 || sErr.ErrorCode == 10054)
+                        return new List<byte>();
+                    throw sErr;
+                }
+                throw e;
+            }
+            catch (Exception) // null, out of range, disposed
+            {
+                return new List<byte>();
+            }
+        }
+        public static int Write(NetworkStream dest, byte[] buffer, int offset, int size)
+        {
+            try
+            {
+                dest.Write(buffer, offset, size);
+                return size;
+            }
+            catch (System.IO.IOException e)
+            {
+                if (e.InnerException is SocketException sErr)
+                {
+                    if (sErr.ErrorCode == 10053 || sErr.ErrorCode == 10054)
+                        return -sErr.ErrorCode;
+                    throw sErr;
+                }
+                throw e;
+            }
+            catch (Exception) // null, out of range, disposed
+            {
+                return -1;
+            }
+        }
+    }
+
     public sealed class ProtocolDistributor : Worker
     {
         static private readonly List<string> SupportedMethods = new List<string>()
         {
             "CONNECT","GET","POST"
         };
-
+        public const int ReceivedBufferSize = 5000;
         private TcpClient m_client = null;
-        ManualResetEvent m_EventReadDone = null;
         static private string GetMethod(string raw_request)
         {
             try
@@ -137,8 +203,6 @@ namespace HttpsProxy
         {
             try
             {
-                m_EventReadDone = new ManualResetEvent(false);
-
                 //Setup socket
                 m_client.ReceiveBufferSize = 5000;
 
@@ -155,119 +219,48 @@ namespace HttpsProxy
         }
         protected override void Run()
         {
-            if (m_client == null || AppSignal.Exit)
-            {
-                ExitInstance();
-                return;
-            }
-
             // Read bytes and traslate client's request into string
-            StreamState ObjectState = new StreamState()
+            List<byte> ReceivedBytes = ProxyOperation.ReadRequest(m_client.GetStream());
+            string rawRequest = Encoding.ASCII.GetString(ReceivedBytes.ToArray());
+
+            if (string.IsNullOrEmpty(rawRequest) == false)
             {
-                Buffer = new byte[m_client.ReceiveBufferSize],
-                ReadStream = m_client.GetStream(),
-                StrBuilder = new StringBuilder()
-            };
-            IAsyncResult Result = m_client.GetStream().BeginRead(ObjectState.Buffer, 0, ObjectState.Buffer.Length, new AsyncCallback(ReadCallBack), ObjectState);
+                Logging.Log(rawRequest);
 
-            // Wait until finishing reading client's request
-            m_EventReadDone.WaitOne();
+                // parsing request and extract its method
+                string RequestMethod = GetMethod(rawRequest);
 
-            // StringBuilder may be null due to connection is closed
-            if (ObjectState.StrBuilder == null)
-            {
-                ExitInstance();
-                return;
-            }
-
-            string FirstRequest = ObjectState.StrBuilder.ToString();
-            Logging.Log(FirstRequest);
-
-            // parsing request and extract its method
-            string RequestMethod = GetMethod(FirstRequest);
-
-            // Check if request's method is supported
-            if (SupportedMethods.IndexOf(RequestMethod) < 0)
-            {
-                byte[] response = Encoding.ASCII.GetBytes("501 Not Implemented\r\n\r\n");
-                m_client.GetStream().Write(response, 0, response.Length);
-            }
-            else
-            {
-                // Create Protocol Processor denpending on what method is received
-                if(RequestMethod == "GET" || RequestMethod == "POST")
+                // Check if request's method is supported
+                if (SupportedMethods.IndexOf(RequestMethod) < 0)
                 {
-                    HttpClient processor = new HttpClient(m_client, FirstRequest);
-                    processor.Start("Http");
+                    byte[] response = Encoding.ASCII.GetBytes("501 Not Implemented\r\n\r\n");
+                    m_client.GetStream().Write(response, 0, response.Length);
                 }
                 else
                 {
-                    HttpsClient processor = new HttpsClient(m_client, FirstRequest);
-                    processor.Start("Https");
+                    // Create Protocol Processor denpending on what method is received
+                    if (RequestMethod == "GET" || RequestMethod == "POST")
+                    {
+                        HttpClient processor = new HttpClient(m_client, rawRequest);
+                        processor.Start("Http Handler", true);
+                    }
+                    else
+                    {
+                        HttpsClient processor = new HttpsClient(m_client, rawRequest);
+                        processor.Start("Https Handler", true);
+                    }
+                    m_client = null;
                 }
-                m_client = null;
             }
             ExitInstance();
-        }
-
-        private void ReadCallBack(IAsyncResult ar)
-        {
-            // Get object state
-            StreamState ObjectState = ar.AsyncState as StreamState;
-
-            NetworkStream stream = ObjectState.ReadStream;
-            StringBuilder builder = ObjectState.StrBuilder;
-            byte[] buffer = ObjectState.Buffer;
-
-            // Get bytes read from client
-            try
-            {
-                int byteRead = stream.EndRead(ar);
-
-                // Translate data into string
-                builder.Append(Encoding.ASCII.GetString(buffer, 0, byteRead));
-
-                Array.Clear(buffer, 0, byteRead);
-                if (stream.DataAvailable)
-                {
-                    // Read until there is no more data to be transferred
-                    stream.BeginRead(buffer, 0, buffer.Length, new AsyncCallback(ReadCallBack), ObjectState);
-                }
-                else m_EventReadDone.Set();
-            }
-            catch (System.IO.IOException e)
-            {
-                if (e.InnerException is SocketException sError)
-                {
-                    if (sError.SocketErrorCode == SocketError.ConnectionAborted ||
-                        sError.SocketErrorCode == SocketError.ConnectionReset)
-                    {
-                        Logging.Log(sError.Message, LoggingLevel.Error);
-
-                        // Connection with client has been closed,
-                        // returned request will be null indicating closed connection
-                        builder = null;
-                        m_EventReadDone.Set();
-                        return;
-                    }
-                    throw sError;
-                }
-                throw e;
-            }
         }
     }
     public sealed class HttpClient : Worker
     {
+        static public int InstanceCount { get; private set; } = 0;
         private string m_request = null;
         private TcpClient m_client = null;
 
-        private AutoResetEvent m_EventReadDone = null;
-        struct DomainEndPoint
-        {
-            public byte[] SentBytes;
-            public IPEndPoint IP;
-            public NetworkStream ClientStream;
-        }
         public HttpClient(TcpClient tcp, string firstRequestString)
         {
             m_request = firstRequestString;
@@ -279,210 +272,108 @@ namespace HttpsProxy
             if (string.IsNullOrEmpty(m_request) || string.IsNullOrWhiteSpace(m_request)) return false;
             if (m_client == null) return false;
 
-            // Already had request string
-            m_EventReadDone = new AutoResetEvent(false);
-
+            ++InstanceCount;
+            Logging.Log(string.Format("HTTP Instances: {0}", InstanceCount), LoggingLevel.Warning);
             return base.InitInstance();
         }
         protected override void ExitInstance()
         {
+            --InstanceCount;
+            Logging.Log(string.Format("1 HTTP instance exited, remain: {0}", InstanceCount), LoggingLevel.Warning);
             m_client.Close();
         }
         protected override void Run()
         {
-            // Handle WSA_IO_PENDING
-
-            // Setup working thread
-            Thread ReadRequest = new Thread(DoReceiveRequest)
+            StreamState streamState = new StreamState()
             {
-                IsBackground = true,
-                Name = "Read Request",
+                Buffer = new byte[m_client.SendBufferSize],
+                ClientStream = m_client.GetStream(),
+                ServerStream = null,
             };
 
-            StreamState state = new StreamState()
+            Thread DoTransfer = new Thread(DoTransferData)
             {
-                Buffer = new byte[m_client.ReceiveBufferSize],
-                ReadStream = m_client.GetStream(),
-                StrBuilder = new StringBuilder(m_request)
+                Name = "Transfer Data",
+                IsBackground = true
             };
 
-            ReadRequest.Start(state);
-
-            //
-            // Parse request
-            //
-
-            //
-            // Get remote server addresses
-            //
-
-            //
-            // Connect and send request to remote host, redirect host's response to client
-            //
-
-            //
-            // Receive request
-            //
-        }
-
-        private void DoReceiveRequest(object state)
-        {
-            StreamState ReceivedState = (StreamState)state;
-            while (true)
+            // Extract remote host endpoint
+            TcpClient server = null;
+            try
             {
-                // Extract remote host endpoint
-
-                if (ReceivedState.StrBuilder == null) return;
-                string DomainEndPoint = GetHostHeader(ReceivedState.StrBuilder.ToString());
+                string DomainEndPoint = GetHostHeader(m_request);
                 IPEndPoint RemoteEndPoint = GetRemoteHostEndPoint(DomainEndPoint);
 
-                // Create thread to handle client's request
-                if (RemoteEndPoint != null)
-                {
-                    DomainEndPoint domain = new DomainEndPoint()
-                    {
-                        IP = RemoteEndPoint,
-                        SentBytes = Encoding.ASCII.GetBytes(ReceivedState.StrBuilder.ToString()),
-                        ClientStream = m_client.GetStream()
-                    };
+                // Connect to remote host by received IPEndPoint
+                server = new TcpClient();
+                server.Connect(RemoteEndPoint);
 
-                    Thread HandleClient = new Thread(DoConnectAndRedirect)
-                    {
-                        IsBackground = true,
-                        Name = "Handling Request",
-                        Priority = ThreadPriority.Highest
-                    };
-                    HandleClient.Start(domain);
-                }
-                else return;    //Client has closed connection => Exit thread
-
-                // Prepare new request by clearing string builder
-                ReceivedState.StrBuilder.Clear();
-
-                // Read Client's request
-                ReceivedState.ReadStream.BeginRead(ReceivedState.Buffer, 0, ReceivedState.Buffer.Length, ReadRequestCallBack, ReceivedState);
-                m_EventReadDone.WaitOne();
+                streamState.ServerStream = server.GetStream();
+                DoTransfer.Start(streamState);
             }
-        }
-        private void DoConnectAndRedirect(object state)
-        {
-            DomainEndPoint domain = (DomainEndPoint)state;
-            if (domain.SentBytes == null || domain.IP == null || domain.ClientStream == null) throw new ArgumentNullException();
-
-            // Connect and send request to server
-            TcpClient server = new TcpClient();
-            server.Connect(domain.IP);
-            server.GetStream().Write(domain.SentBytes, 0, domain.SentBytes.Length);
-
-            //
-            // Wait for parsing process finished, do checking cache, list of allowed domains, modify response.... -> Not Implemented
-            //
-
-            StreamState received = new StreamState()
+            catch (ArgumentNullException)
             {
-                Buffer = new byte[server.ReceiveBufferSize],
-                ReadStream = server.GetStream(),
-                WriteStream = domain.ClientStream,
-                StrBuilder = null
-            };
+                ExitInstance();
+                return;
+            }
 
-            // Transfer data from remote host to client
-            server.GetStream().BeginRead(received.Buffer, 0, received.Buffer.Length, ReadResponseCallBack, received);
-        }
-
-        private void ReadRequestCallBack(IAsyncResult ar)
-        {
-            // Get object state
-            StreamState ObjectState = ar.AsyncState as StreamState;
-            StringBuilder builder = ObjectState.StrBuilder;
-            NetworkStream stream = ObjectState.ReadStream;
-            byte[] buffer = ObjectState.Buffer;
-
-            try
+            List<byte> ReceivedBytes = new List<byte>(Encoding.ASCII.GetBytes(m_request));
+            do
             {
-                // Get bytes read from client
-                int byteRead = stream.EndRead(ar);
 
-                // Gracefully closed from client
-                if (byteRead == 0)
+                int ErrorCode = ProxyOperation.Write(server.GetStream(), ReceivedBytes.ToArray(), 0, ReceivedBytes.Count);
+                if (ErrorCode < 0)
                 {
-                    ObjectState.StrBuilder = null;
+                    // An error has occurred => proceed to close thread
+                    Logging.Log(string.Format("SocketException occured with error code: {0}", ErrorCode), LoggingLevel.Error);
+                    server.Close();
+                    m_client.Close();
+                }
+                ReceivedBytes = ProxyOperation.ReadRequest(m_client.GetStream());
+
+            } while (ReceivedBytes.Count != 0);
+
+            ExitInstance();
+        }
+        private void DoTransferData(object state)
+        {
+            StreamState streamState = state as StreamState;
+            if (streamState == null) throw new ArgumentNullException();
+
+            NetworkStream WStream = streamState.ClientStream as NetworkStream;
+            NetworkStream RStream = streamState.ServerStream as NetworkStream;
+
+            while (true)
+            {
+                try
+                {
+                    int bytesRead = RStream.Read(streamState.Buffer, 0, streamState.Buffer.Length);
+                    WStream.WriteAsync(streamState.Buffer, 0, bytesRead);
+                }
+                catch (System.IO.IOException e)
+                {
+                    if (e.InnerException is SocketException sErr)
+                    {
+                        if (sErr.ErrorCode == 10053 || sErr.ErrorCode == 10054 || sErr.ErrorCode == 10058)
+                            return;
+                        throw sErr;
+                    }
+                    else if(e.InnerException is ObjectDisposedException)
+                    {
+                        return;
+                    }
+                    throw e;
+                }
+                catch (ObjectDisposedException)
+                {
                     return;
                 }
-
-                // Translate data into string
-                builder.Append(Encoding.ASCII.GetString(buffer, 0, byteRead));
-
-                Array.Clear(buffer, 0, byteRead);
-                if (stream.DataAvailable)
-                {
-                    // Read until there is no more data to be transferred
-                    stream.BeginRead(buffer, 0, buffer.Length, new AsyncCallback(ReadRequestCallBack), ObjectState);
-                }
-                else m_EventReadDone.Set();
-            }
-            catch (System.IO.IOException e)
-            {
-                if (e.InnerException is SocketException sError)
-                {
-                    if (sError.SocketErrorCode == SocketError.ConnectionAborted ||
-                        sError.SocketErrorCode == SocketError.ConnectionReset)
-                    {
-                        Logging.Log(sError.Message, LoggingLevel.Error);
-
-                        // Client has closed connection => set String Builder to close indicating there is no more request to handle
-                        ObjectState.StrBuilder = null;
-                        m_EventReadDone.Set();
-                        return;
-                    }
-                    throw sError;
-                }
-                throw e;
             }
         }
-        private void ReadResponseCallBack(IAsyncResult ar)
-        {
-            // Get object state
-            StreamState ObjectState = ar.AsyncState as StreamState;
-
-            NetworkStream ServerStream = ObjectState.ReadStream;
-            NetworkStream ClientStream = ObjectState.WriteStream;
-            byte[] buffer = ObjectState.Buffer;
-
-            // Get bytes read from client
-            try
-            {
-                int byteRead = ServerStream.EndRead(ar);
-
-                // Send data to client
-                ClientStream.WriteAsync(buffer, 0, byteRead);
-
-                Array.Clear(buffer, 0, byteRead);
-                if (ServerStream.DataAvailable)
-                {
-                    // Read and until there is no more data to be transferred
-                    ServerStream.BeginRead(buffer, 0, buffer.Length, new AsyncCallback(ReadRequestCallBack), ObjectState);
-                }
-            }
-            catch (System.IO.IOException e)
-            {
-                if (e.InnerException is SocketException sError)
-                {
-                    if (sError.SocketErrorCode == SocketError.ConnectionAborted ||
-                        sError.SocketErrorCode == SocketError.ConnectionReset)
-                    {
-                        Logging.Log(sError.Message, LoggingLevel.Error);
-                        return;
-                    }
-                    throw sError;
-                }
-                throw e;
-            }
-        }
-        private IPEndPoint GetRemoteHostEndPoint(string DomainEndPoint)
+        static public IPEndPoint GetRemoteHostEndPoint(string DomainEndPoint)
         {
             if (string.IsNullOrEmpty(DomainEndPoint)) return null;
-            string HostName = null, Port = null;
+            string Port = null;
 
             int i = DomainEndPoint.IndexOf(':');
             if (i < 0)
@@ -492,17 +383,19 @@ namespace HttpsProxy
             }
             else
                 Port = DomainEndPoint.Substring(DomainEndPoint.IndexOf(':') + 1);
-            HostName = DomainEndPoint.Substring(0, i);
+            string HostName = DomainEndPoint.Substring(0, i);
             try
             {
-                return new IPEndPoint(Dns.GetHostAddresses(HostName)[1], Convert.ToInt32(Port));
+                // Get IPv4 address
+                IPAddress[] addresses = Dns.GetHostAddresses(HostName);
+                return new IPEndPoint(addresses[addresses.Length - 1], Convert.ToInt32(Port));
             }
             catch (Exception)
             {
                 return null;
             }
         }
-        private string GetHostHeader(string raw_request)
+        static public string GetHostHeader(string raw_request)
         {
             if (string.IsNullOrEmpty(raw_request)) return null;
             if (string.IsNullOrWhiteSpace(raw_request)) return null;
@@ -516,11 +409,13 @@ namespace HttpsProxy
             return DomainEndPoint;
         }
     }
+
     public sealed class HttpsClient : Worker
     {
+        public static int InstanceCount { get; private set; } = 0;
         private string m_request = null;
         private TcpClient m_client = null;
-        public HttpsClient(TcpClient tcp,string firstRequest)
+        public HttpsClient(TcpClient tcp, string firstRequest)
         {
             m_request = firstRequest;
             m_client = tcp;
@@ -528,35 +423,131 @@ namespace HttpsProxy
 
         protected override bool InitInstance()
         {
-            return false;
-
             if (string.IsNullOrEmpty(m_request) || string.IsNullOrWhiteSpace(m_request)) return false;
             if (m_client == null) return false;
 
-
+            ++InstanceCount;
+            Logging.Log(string.Format("HTTPS instances: {0}", InstanceCount),LoggingLevel.Warning);
             return base.InitInstance();
+        }
+        protected override void ExitInstance()
+        {
+            m_client.Close();
+            --InstanceCount;
+            Logging.Log(string.Format("HTTPS remain: {0}", InstanceCount), LoggingLevel.Warning);
+            base.ExitInstance();
         }
         protected override void Run()
         {
-            //
-            // Receive request
-            //
+            // Get host EndPoint
+            string[] domain = GetDomain(m_request);
+            IPEndPoint hostEndPoint = GetHostEndPoint(domain[0], domain[1]);
+            if(hostEndPoint == null)
+            {
+                ExitInstance();
+                return;
+            }
 
-            //
-            // Parse request
-            //
+            // Connect to remote host and authenticate connection
+            TcpClient server = new TcpClient();
+            server.Connect(hostEndPoint);
 
-            //
-            // Connect and send request to remote host, redirect host's response to client
-            //
+            // Accept tunneling
+            byte[] AcceptConnection = Encoding.ASCII.GetBytes("HTTP/1.1 200 Established\r\n\r\n");
+            ProxyOperation.Write(m_client.GetStream(), AcceptConnection, 0, AcceptConnection.Length);
 
-            throw new NotImplementedException();
+            StreamState streamState = new StreamState()
+            {
+                ClientStream = m_client.GetStream(),
+                ServerStream = server.GetStream(),
+            };
+
+            Thread DoTransfer = new Thread(DoTransferData)
+            {
+                Name = "HTTPS Transfer Data",
+                IsBackground = true
+            };
+            DoTransfer.Start(streamState);
+
+            List<byte> ReceivedBytes;
+            do
+            {
+                ReceivedBytes = ProxyOperation.ReadRequest(m_client.GetStream());
+                int errCode = ProxyOperation.Write(server.GetStream(), ReceivedBytes.ToArray(), 0, ReceivedBytes.Count);
+                if(errCode < 0)
+                {
+                    ReceivedBytes.Clear();
+                    Logging.Log(string.Format("Socket Exception with error code: {0}", errCode), LoggingLevel.Error);
+                }
+            } while (ReceivedBytes.Count != 0);
+            ExitInstance();
+
         }
-
-        private void ReadCallBack(IAsyncResult ar)
+        /// <summary>
+        /// Read response from server and forward to client
+        /// </summary>
+        /// <param name="objState"></param>
+        private void DoTransferData(object objState)
         {
-
+            StreamState streamState = objState as StreamState;
+            NetworkStream readStream = streamState.ServerStream as NetworkStream;
+            NetworkStream writeStream = streamState.ClientStream as NetworkStream;
+            byte[] buffer = new byte[Default.SendBufferSize];
+            try
+            {
+                while (true)
+                {
+                    int bytesRead = readStream.Read(buffer, 0, buffer.Length);
+                    ProxyOperation.Write(writeStream, buffer, 0, bytesRead);
+                }
+            }
+            catch (IOException e)
+            {
+                if (e.InnerException is SocketException sErr)
+                {
+                    if (sErr.ErrorCode == 10053 || sErr.ErrorCode == 10054)
+                    {
+                        return;
+                    }
+                    throw sErr;
+                }
+                throw e;
+            }
+            catch (ObjectDisposedException)
+            {
+                return;
+            }
+ 
+        }
+        private string[] GetDomain(string rawRequest)
+        {
+            string hostName, port;
+            int hostStart = rawRequest.IndexOf(' ') + 1;
+            int hostEnd = rawRequest.IndexOf(':', hostStart);
+            int portEnd = rawRequest.IndexOf(' ', hostEnd + 1);
+            try
+            {
+                hostName = rawRequest.Substring(hostStart, hostEnd - hostStart);
+                port = rawRequest.Substring(hostEnd + 1, portEnd - hostEnd - 1);
+            }
+            catch (ArgumentOutOfRangeException)
+            {
+                hostName = port = string.Empty;
+            }
+            return new string[2] { hostName, port };
+        }
+        private IPEndPoint GetHostEndPoint(string hostName, string port)
+        {
+            try
+            {
+                // Get IPv4 address
+                IPAddress[] addresses = Dns.GetHostAddresses(hostName);
+                return new IPEndPoint(addresses[addresses.Length - 1], Convert.ToInt32(port));
+            }
+            catch (Exception)
+            {
+                return null;
+            }
         }
     }
-
 }
