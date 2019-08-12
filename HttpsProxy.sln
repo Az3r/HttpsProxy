@@ -7,6 +7,8 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "HttpsProxy", "HttpsProxy\Ht
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ProxyTesting", "ProxyTesting\ProxyTesting.csproj", "{D4089168-B21D-4414-B17B-4788DD0FB060}"
 EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ProxyLibrary", "ProxyLibrary\ProxyLibrary.csproj", "{584D9397-C26E-4A08-BBD2-A48357FC5041}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -21,6 +23,10 @@ Global
 		{D4089168-B21D-4414-B17B-4788DD0FB060}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{D4089168-B21D-4414-B17B-4788DD0FB060}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{D4089168-B21D-4414-B17B-4788DD0FB060}.Release|Any CPU.Build.0 = Release|Any CPU
+		{584D9397-C26E-4A08-BBD2-A48357FC5041}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{584D9397-C26E-4A08-BBD2-A48357FC5041}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{584D9397-C26E-4A08-BBD2-A48357FC5041}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{584D9397-C26E-4A08-BBD2-A48357FC5041}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
